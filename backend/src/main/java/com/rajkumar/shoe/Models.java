@@ -1,7 +1,8 @@
 package com.rajkumar.shoe;
 import com.fasterxml.jackson.annotation.JsonIgnore;
 import jakarta.persistence.*;
-import org.springframework.data.jpa.repository.JpaRepository;
+import org.springframework.data.jpa.repository.*;
+import org.springframework.data.repository.query.Param;
 import java.time.LocalDateTime;
 import java.util.*;
 
@@ -12,6 +13,14 @@ public class Models {
     public String name, role="USER";
     @Column(unique=true) public String phone;
     @Column(unique=true) public String email;
+    @Column(length=500) public String address;
+    @Column(name="address_name",length=100) public String addressName;
+    @Column(name="address_phone",length=20) public String addressPhone;
+    @Column(name="address_house",length=180) public String addressHouse;
+    @Column(name="address_area",length=180) public String addressArea;
+    @Column(name="address_landmark",length=180) public String addressLandmark;
+    @Column(name="address_city",length=120) public String addressCity;
+    @Column(name="address_pincode",length=10) public String addressPincode;
     @JsonIgnore public String passwordHash; }
 
   @Entity @Table(name="otp_verifications", indexes={@Index(name="idx_otp_target_purpose", columnList="target_value,purpose")})
@@ -34,6 +43,7 @@ public class Models {
     @Column(length=500) public String description;
     @Column(name="image_content_type") public String imageContentType;
     @Lob @Column(name="image_data",columnDefinition="BLOB") @JsonIgnore public byte[] imageData;
+    @Lob @Column(name="variants_data",columnDefinition="CLOB") @JsonIgnore public String variantsData;
     public int price, mrp, stock; public boolean active=true; }
 
   /** type: MATERIAL|REPAIR|CUSTOM|BULK_REPAIR · paymentMode: ONLINE|PAY_ON_DELIVERY|QUOTE
@@ -45,8 +55,13 @@ public class Models {
     public Long userId;
     @Column(length=1000) public String description;
     @Column(length=500) public String address, adminNote;
+    @Column(name="delivery_name",length=100) public String deliveryName;
+    @Column(name="delivery_phone",length=20) public String deliveryPhone;
     @Column(name="footwear_type",length=255) public String footwearType;
     @Column(name="estimated_quantity") public Integer estimatedQuantity;
+    @Column(name="razorpay_order_id",length=100) public String razorpayOrderId;
+    @Column(name="razorpay_payment_id",length=100) public String razorpayPaymentId;
+    @Lob @Column(name="items_data",columnDefinition="CLOB") public String itemsData;
     public int total, advance, paidAmount; public boolean pickup; @Column(columnDefinition="TIMESTAMP") public LocalDateTime createdAt; }
 
   @Entity @Table(name="order_images") public static class OrderImage {
@@ -108,8 +123,14 @@ public class Models {
   public interface Products extends JpaRepository<Product,Long> {
     List<Product> findByActiveTrueOrderByIdDesc();
     List<Product> findAllByOrderByIdDesc();
+    @Lock(LockModeType.PESSIMISTIC_WRITE)
+    @Override Optional<Product> findById(Long id);
   }
-  public interface Bookings extends JpaRepository<Booking,Long> { List<Booking> findByUserIdOrderByIdDesc(Long u); List<Booking> findAllByOrderByIdDesc();  }
+  public interface Bookings extends JpaRepository<Booking,Long> {
+    List<Booking> findByUserIdOrderByIdDesc(Long u);
+    List<Booking> findAllByOrderByIdDesc();
+    List<Booking> findByPaymentModeAndPaymentStatusAndStatus(String paymentMode,String paymentStatus,String status);
+  }
   public interface OrderImages extends JpaRepository<OrderImage,Long> { List<OrderImage> findByOrderIdOrderByIdAsc(Long orderId); Optional<OrderImage> findByIdAndOrderId(Long id,Long orderId); }
   public interface RepairOrderImages extends JpaRepository<RepairOrderImage,Long> { List<RepairOrderImage> findByOrderIdOrderByIdAsc(Long orderId); }
   public interface Notes extends JpaRepository<Notification,Long> {

@@ -4,6 +4,10 @@ import com.rajkumar.shoe.auth.OtpProtectionService;
 import com.rajkumar.shoe.common.NotificationMessages;
 import com.rajkumar.shoe.config.StaticDataConfig;
 import com.rajkumar.shoe.notification.OrderNotificationChannels;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.core.type.TypeReference;
+import com.fasterxml.jackson.databind.JsonNode;
+import com.fasterxml.jackson.databind.ObjectMapper;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.boot.CommandLineRunner;
 import org.springframework.http.HttpStatus;
@@ -12,6 +16,7 @@ import org.springframework.security.core.Authentication;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
 import org.springframework.security.crypto.password.PasswordEncoder;
 import org.springframework.stereotype.*;
+import org.springframework.scheduling.annotation.Scheduled;
 import org.springframework.transaction.annotation.Transactional;
 import org.springframework.transaction.support.TransactionSynchronization;
 import org.springframework.transaction.support.TransactionSynchronizationManager;
@@ -29,18 +34,6 @@ import java.util.*;
 public class Api {
   static ResponseStatusException bad(String m){ return new ResponseStatusException(HttpStatus.BAD_REQUEST,m); }
   static ResponseStatusException nf(){ return new ResponseStatusException(HttpStatus.NOT_FOUND,"Not found"); }
-  static String cancellationAdminMessage(Booking order,String reason,String fallbackReason,String countryCode){
-    String phone=order.userPhone==null?"":order.userPhone.replaceAll("\\D","");
-    if(phone.length()==10)phone=(countryCode==null?"":countryCode.replaceAll("\\D",""))+phone;
-    String product=order.description==null?order.type:order.description;
-    String effectiveReason=reason==null||reason.isBlank()?fallbackReason:reason;
-    String customerMessage=String.format(NotificationMessages.ORDER_CANCELLATION_WHATSAPP_TEXT,
-      order.userName,order.type==null?"order":order.type.replace('_',' '),order.orderNo,product,effectiveReason);
-    String contactLink=phone.isBlank()?"Unavailable: customer phone number is missing."
-      :"https://wa.me/"+phone+"?text="+java.net.URLEncoder.encode(customerMessage,java.nio.charset.StandardCharsets.UTF_8);
-    return String.format(NotificationMessages.ORDER_CANCELLATION_CONTACT_MESSAGE,order.orderNo,
-      order.userName,product,effectiveReason,contactLink);
-  }
   static String cancellationAdminMessage(Booking order,String reason,String fallbackReason,String countryCode){
     String phone=order.userPhone==null?"":order.userPhone.replaceAll("\\D","");
     if(phone.length()==10)phone=(countryCode==null?"":countryCode.replaceAll("\\D",""))+phone;
@@ -232,7 +225,7 @@ public class Api {
       UserSession session=sessions.findByRefreshTokenHash(hashToken(raw))
         .orElseThrow(()->new ResponseStatusException(HttpStatus.UNAUTHORIZED,"Session expired. Please sign in again."));
       LocalDateTime now=LocalDateTime.now();
-      if(session.lastActivity==null||java.time.Duration.between(session.lastActivity,now).toMillis()>=idleTimeoutMs){
+      if(session.lastActivity==null||java.time.Duration.between(session.lastActivity,now).toMillis()>idleTimeoutMs){
         sessions.delete(session);
         throw new ResponseStatusException(HttpStatus.UNAUTHORIZED,"Session expired after inactivity. Please sign in again.");
       }
@@ -328,25 +321,67 @@ public class Api {
   }
 
   @RestController public static class Prods {
-    final Products p; public Prods(Products p){ this.p=p; }
+    final Products p; final ObjectMapper mapper;
+    public Prods(Products p,ObjectMapper mapper){ this.p=p; this.mapper=mapper; }
     static final Set<String> PRODUCT_CATEGORIES=Set.of("Soles","Adhesives","Heels","Insoles","Polish","Leather","Tools","Other");
-    public record ProductView(Long id,String name,String category,String emoji,String description,int price,int mrp,int stock,boolean active,String imageUrl){}
-    void validateProduct(Product product){
-      if(product==null||product.name==null||product.name.trim().length()<2||product.name.trim().length()>255)throw bad("Enter a product name from 2 to 255 characters.");
-      if(product.category==null||!PRODUCT_CATEGORIES.contains(product.category))throw bad("Choose a valid product section.");
-      if(product.price<0||product.mrp<0||product.stock<0)throw bad("Price, MRP, and stock cannot be negative.");
-      if(product.description!=null&&product.description.length()>500)throw bad("Product description must be 500 characters or fewer.");
+    public record VariantInput(String id,Map<String,String> options,int price,int mrp,int stock){}
+    public record VariantView(String id,Map<String,String> options,int price,int mrp,int stock){}
+    public record ProductInput(String name,String category,String emoji,String description,int price,int mrp,int stock,boolean active,List<VariantInput> variants){}
+    public record ProductView(Long id,String name,String category,String emoji,String description,int price,int mrp,int stock,boolean active,String imageUrl,List<VariantView> variants){}
+    void validateProduct(ProductInput product){
+      if(product==null||product.name()==null||product.name().trim().length()<2||product.name().trim().length()>255)throw bad("Enter a product name from 2 to 255 characters.");
+      if(product.category()==null||!PRODUCT_CATEGORIES.contains(product.category()))throw bad("Choose a valid product section.");
+      if(product.price()<0||product.mrp()<0||product.stock()<0)throw bad("Price, MRP, and stock cannot be negative.");
+      if(product.description()!=null&&product.description().length()>500)throw bad("Product description must be 500 characters or fewer.");
+      List<VariantInput> variants=product.variants()==null?List.of():product.variants();
+      if(variants.size()>100)throw bad("A product can have up to 100 variants.");
+      Set<String> ids=new HashSet<>(),combinations=new HashSet<>(); Set<String> optionNames=null; int variantStockTotal=0;
+      for(VariantInput variant:variants){
+        if(variant==null||variant.options()==null||variant.options().isEmpty()||variant.options().size()>8)
+          throw bad("Each variant needs between 1 and 8 option values.");
+        if(variant.price()<0||variant.mrp()<variant.price()||variant.stock()<0)
+          throw bad("Each variant needs a non-negative price, MRP at least the price, and non-negative stock.");
+        TreeMap<String,String> clean=new TreeMap<>(String.CASE_INSENSITIVE_ORDER);
+        variant.options().forEach((key,value)->{
+          if(key==null||value==null||key.trim().isEmpty()||key.trim().length()>30||value.trim().isEmpty()||value.trim().length()>80)
+            throw bad("Variant option names and values must be between 1 and 80 characters.");
+          clean.put(key.trim(),value.trim());
+        });
+        Set<String> names=clean.keySet().stream().map(name->name.toLowerCase(Locale.ROOT)).collect(java.util.stream.Collectors.toSet());
+        if(optionNames==null)optionNames=names;
+        else if(!optionNames.equals(names))throw bad("All variants for a product must use the same option names.");
+        if(clean.values().stream().anyMatch(String::isBlank))throw bad("Variant options cannot be empty.");
+        String combination=clean.toString().toLowerCase(Locale.ROOT);
+        if(!combinations.add(combination))throw bad("Each variant combination must be unique.");
+        try{variantStockTotal=Math.addExact(variantStockTotal,variant.stock());}
+        catch(ArithmeticException ex){throw bad("Combined variant stock is too large.");}
+        String id=variant.id();
+        if(id!=null&&!id.isBlank()&&!ids.add(id))throw bad("Variant identifiers must be unique.");
+      }
     }
-    ProductView view(Product product){
+    List<VariantView> variants(Product product){
+      if(product.variantsData==null||product.variantsData.isBlank())return List.of();
+      try{return mapper.readValue(product.variantsData,new TypeReference<List<VariantView>>(){});}
+      catch(JsonProcessingException ex){throw new IllegalStateException("Stored product variants are invalid for product "+product.id,ex);}
+    }
+    void setVariants(Product product,List<VariantInput> input){
+      if(input==null){product.variantsData=null;return;}
+      List<VariantView> result=input.stream().map(value->new VariantView(
+        value.id()==null||value.id().isBlank()?UUID.randomUUID().toString():value.id(),
+        new TreeMap<>(value.options()),value.price(),value.mrp(),value.stock())).toList();
+      try{product.variantsData=mapper.writeValueAsString(result);}
+      catch(JsonProcessingException ex){throw new IllegalStateException("Could not store product variants.",ex);}
+    }
+    ProductView productView(Product product,boolean admin){
+      List<VariantView> choices=variants(product);
+      int price=choices.isEmpty()?product.price:choices.stream().mapToInt(VariantView::price).min().orElse(product.price);
+      int mrp=choices.isEmpty()?product.mrp:choices.stream().mapToInt(VariantView::mrp).max().orElse(product.mrp);
+      int stock=choices.isEmpty()?product.stock:choices.stream().mapToInt(VariantView::stock).sum();
       return new ProductView(product.id,product.name,product.category,product.emoji,product.description,
-        product.price,product.mrp,product.stock,product.active,product.imageData==null?null:"/api/products/"+product.id+"/image");
+        price,mrp,stock,product.active,product.imageData==null?null:(admin?"/api/admin/products/":"/api/products/")+product.id+"/image",choices);
     }
-    ProductView adminView(Product product){
-      return new ProductView(product.id,product.name,product.category,product.emoji,product.description,
-        product.price,product.mrp,product.stock,product.active,product.imageData==null?null:"/api/admin/products/"+product.id+"/image");
-    }
-    @GetMapping("/api/products") public List<ProductView> list(){ return p.findByActiveTrueOrderByIdDesc().stream().map(this::view).toList(); }
-    @GetMapping("/api/admin/products") public List<ProductView> adminList(){ return p.findAllByOrderByIdDesc().stream().map(this::adminView).toList(); }
+    @GetMapping("/api/products") public List<ProductView> list(){ return p.findByActiveTrueOrderByIdDesc().stream().map(product->productView(product,false)).toList(); }
+    @GetMapping("/api/admin/products") public List<ProductView> adminList(){ return p.findAllByOrderByIdDesc().stream().map(product->productView(product,true)).toList(); }
     @GetMapping("/api/products/{id}/image") public ResponseEntity<byte[]> image(@PathVariable Long id){
       Product product=p.findById(id).filter(x->x.active&&x.imageData!=null&&x.imageContentType!=null)
         .orElseThrow(Api::nf);
@@ -357,28 +392,33 @@ public class Api {
       return ResponseEntity.ok().contentType(MediaType.parseMediaType(product.imageContentType)).body(product.imageData);
     }
     @PostMapping(path="/api/admin/products",consumes=MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ProductView add(@RequestPart("product") Product x,@RequestPart(value="image",required=false) MultipartFile image) throws IOException {
+    public ProductView add(@RequestPart("product") ProductInput x,@RequestPart(value="image",required=false) MultipartFile image) throws IOException {
       validateProduct(x);
+      Product product=new Product();
+      product.name=x.name().trim(); product.category=x.category().trim(); product.emoji=x.emoji();
+      product.description=x.description(); product.price=x.price(); product.mrp=Math.max(x.mrp(),x.price());
+      product.stock=x.stock(); product.active=x.active();
+      setVariants(product,x.variants());
       if(image!=null&&!image.isEmpty()){
         if(image.getSize()>5L*1024*1024||!validImage(image))
           throw bad("Product image must be a valid JPG, PNG, or WebP image no larger than 5 MB.");
-        x.imageData=image.getBytes();
-        x.imageContentType=image.getContentType();
+        product.imageData=image.getBytes();
+        product.imageContentType=image.getContentType();
       }
-      x.id=null; x.name=x.name.trim(); x.category=x.category.trim(); x.active=true; if(x.mrp<x.price) x.mrp=x.price;
-      return adminView(p.save(x));
+      return productView(p.save(product),true);
     }
-    void updateFields(Product o,Product x){
+    void updateFields(Product o,ProductInput x){
       validateProduct(x);
-      o.name=x.name.trim(); o.category=x.category.trim(); o.price=x.price; o.mrp=Math.max(x.mrp,x.price);
-      o.emoji=x.emoji; o.description=x.description; o.stock=x.stock; o.active=x.active;
+      o.name=x.name().trim(); o.category=x.category().trim(); o.price=x.price(); o.mrp=Math.max(x.mrp(),x.price());
+      o.emoji=x.emoji(); o.description=x.description(); o.stock=x.stock(); o.active=x.active();
+      if(x.variants()!=null)setVariants(o,x.variants());
     }
-    @PutMapping(path="/api/admin/products/{id}",consumes=MediaType.APPLICATION_JSON_VALUE)
-    public ProductView upd(@PathVariable Long id,@RequestBody Product x){
-      Product o=p.findById(id).orElseThrow(Api::nf); updateFields(o,x); return adminView(p.save(o));
+    @PutMapping(path="/api/admin/products/{id}",consumes=MediaType.APPLICATION_JSON_VALUE) @Transactional
+    public ProductView upd(@PathVariable Long id,@RequestBody ProductInput x){
+      Product o=p.findById(id).orElseThrow(Api::nf); updateFields(o,x); return productView(p.save(o),true);
     }
-    @PutMapping(path="/api/admin/products/{id}",consumes=MediaType.MULTIPART_FORM_DATA_VALUE)
-    public ProductView updWithImage(@PathVariable Long id,@RequestPart("product") Product x,
+    @PutMapping(path="/api/admin/products/{id}",consumes=MediaType.MULTIPART_FORM_DATA_VALUE) @Transactional
+    public ProductView updWithImage(@PathVariable Long id,@RequestPart("product") ProductInput x,
         @RequestPart(value="image",required=false) MultipartFile image,
         @RequestParam(value="removeImage",defaultValue="false") boolean removeImage) throws IOException {
       Product o=p.findById(id).orElseThrow(Api::nf);
@@ -388,13 +428,55 @@ public class Api {
           throw bad("Product image must be a valid JPG, PNG, or WebP image no larger than 5 MB.");
         o.imageData=image.getBytes(); o.imageContentType=image.getContentType();
       }else if(removeImage){ o.imageData=null; o.imageContentType=null; }
-      return adminView(p.save(o));
+      return productView(p.save(o),true);
     }
     @DeleteMapping("/api/admin/products/{id}") public void del(@PathVariable Long id){ p.findById(id).ifPresent(o->{ o.active=false; p.save(o); }); } }
 
+  @RestController @RequestMapping("/api/account") public static class Account {
+    final Users users;
+    public Account(Users users){this.users=users;}
+    public record ProfileUpdate(String name,String email,String addressName,String addressPhone,String addressHouse,
+        String addressArea,String addressLandmark,String addressCity,String addressPincode){}
+    @GetMapping public AppUser profile(@AuthenticationPrincipal Long uid){
+      return users.findById(uid).orElseThrow(Api::nf);
+    }
+    @PutMapping @Transactional public AppUser update(@AuthenticationPrincipal Long uid,@RequestBody ProfileUpdate request){
+      if(request==null)throw bad("Enter your profile details.");
+      AppUser user=users.findById(uid).orElseThrow(Api::nf);
+      String name=request.name()==null?"":request.name().trim();
+      String email=request.email()==null?"":request.email().trim().toLowerCase(Locale.ROOT);
+      String addressName=request.addressName()==null?"":request.addressName().trim();
+      String addressPhone=request.addressPhone()==null?"":request.addressPhone().replaceAll("\\D","");
+      if(name.length()<2||name.length()>100)throw bad("Name must be between 2 and 100 characters.");
+      if(!email.isEmpty()&&(email.length()>255||!email.matches("^[^\\s@]+@[^\\s@]+\\.[^\\s@]+$")))
+        throw bad("Enter a valid email address.");
+      if(!email.isEmpty()&&users.findByEmailIgnoreCase(email).filter(existing->!existing.id.equals(uid)).isPresent())
+        throw new ResponseStatusException(HttpStatus.CONFLICT,"This email address is already registered.");
+      String house=trimOrEmpty(request.addressHouse()),area=trimOrEmpty(request.addressArea());
+      String landmark=trimOrEmpty(request.addressLandmark()),city=trimOrEmpty(request.addressCity());
+      String pincode=trimOrEmpty(request.addressPincode());
+      if(house.length()>180||area.length()>180||landmark.length()>180||city.length()>120||pincode.length()>10||addressName.length()>100)
+        throw bad("One or more address fields are too long.");
+      boolean hasAddress=List.of(house,area,landmark,city,pincode).stream().anyMatch(value->!value.isBlank());
+      if(hasAddress&&(house.isBlank()||area.isBlank()||city.isBlank()||!pincode.matches("\\d{6}")||addressName.length()<2||addressPhone.length()!=10))
+        throw bad("A saved address needs a recipient name and a separate 10-digit delivery phone number.");
+      user.name=name; user.email=email.isEmpty()?null:email;
+      user.address=hasAddress?String.join(", ",java.util.stream.Stream.of(house,area,landmark,city,pincode).filter(value->!value.isBlank()).toList()):null;
+      user.addressName=hasAddress?addressName:null; user.addressPhone=hasAddress?addressPhone:null;
+      user.addressHouse=hasAddress?house:null; user.addressArea=hasAddress?area:null;
+      user.addressLandmark=hasAddress&&!landmark.isBlank()?landmark:null; user.addressCity=hasAddress?city:null;
+      user.addressPincode=hasAddress?pincode:null;
+      return users.save(user);
+    }
+    static String trimOrEmpty(String value){return value==null?"":value.trim();}
+  }
+
   @RestController public static class Cfg {
-    final Settings s; public Cfg(Settings s){ this.s=s; }
-    @GetMapping("/api/settings/public") public Map<String,String> pub(){ Map<String,String> m=new HashMap<>(); s.findAll().forEach(x->m.put(x.skey,x.svalue)); return m; }
+    final Settings s; final boolean razorpayConfigured;
+    public Cfg(Settings s,@Value("${app.razorpay.key-id:}") String keyId,@Value("${app.razorpay.key-secret:}") String keySecret){
+      this.s=s; razorpayConfigured=!keyId.isBlank()&&!keySecret.isBlank();
+    }
+    @GetMapping("/api/settings/public") public Map<String,String> pub(){ Map<String,String> m=new HashMap<>(); s.findAll().forEach(x->m.put(x.skey,x.svalue)); m.put("razorpay_enabled",String.valueOf(razorpayConfigured)); return m; }
     @PutMapping("/api/admin/settings") public Map<String,String> put(@RequestBody Map<String,String> b){
       if(b==null)throw bad("Provide payment settings.");
       String upi=b.get("upi_id"),payee=b.get("payee_name");
@@ -413,16 +495,19 @@ public class Api {
 
   @RestController @RequestMapping("/api/orders") public static class Ords {
     final Bookings o; final Products p; final Users u; final Notify n; final OrderImages images; final RepairOrderImages repairImages;
-    final StaticDataConfig staticData;
+    final StaticDataConfig staticData; final ObjectMapper mapper;
     final String whatsAppCountryCode;
-    public Ords(Bookings o,Products p,Users u,Notify n,OrderImages images,RepairOrderImages repairImages,StaticDataConfig staticData,
-        @Value("${app.notifications.whatsapp-country-code:91}") String whatsAppCountryCode){
-      this.o=o; this.p=p; this.u=u; this.n=n; this.images=images; this.repairImages=repairImages; this.staticData=staticData;
-      this.whatsAppCountryCode=whatsAppCountryCode;
+    final String razorpayKeyId,razorpayKeySecret;
+    public Ords(Bookings o,Products p,Users u,Notify n,OrderImages images,RepairOrderImages repairImages,StaticDataConfig staticData,ObjectMapper mapper,
+        @Value("${app.notifications.whatsapp-country-code:91}") String whatsAppCountryCode,
+        @Value("${app.razorpay.key-id:}") String razorpayKeyId,
+        @Value("${app.razorpay.key-secret:}") String razorpayKeySecret){
+      this.o=o; this.p=p; this.u=u; this.n=n; this.images=images; this.repairImages=repairImages; this.staticData=staticData; this.mapper=mapper;
+      this.whatsAppCountryCode=whatsAppCountryCode; this.razorpayKeyId=razorpayKeyId; this.razorpayKeySecret=razorpayKeySecret;
     }
-    public record Item(Long productId,int qty){}
+    public record Item(Long productId,String variantId,int qty){}
     public record NewOrder(String type,String service,String description,List<Item> items,String paymentMode,boolean pickup,String address,
-      String footwearType,Integer estimatedQuantity,String showroomLocation){}
+      String deliveryName,String deliveryPhone,String footwearType,Integer estimatedQuantity,String showroomLocation){}
     public record PaymentSubmission(String utr){}
     public record QuoteResponse(Boolean accepted){}
     public record Cancellation(String reason){}
@@ -446,9 +531,38 @@ public class Api {
       if(type.equals("MATERIAL")){
         if(r.items()==null||r.items().isEmpty()) throw bad("Cart is empty");
         StringBuilder sb=new StringBuilder();
-        for(Item i:r.items()){ Product pr=p.findById(i.productId()).filter(x->x.active).orElseThrow(()->bad("Product not found"));
-          if(i.qty()<1||pr.stock<i.qty()) throw bad(pr.name+" is out of stock");
-          pr.stock-=i.qty(); p.save(pr); base+=pr.price*i.qty(); sb.append(pr.name).append(" x").append(i.qty()).append(", "); }
+        for(Item i:r.items()){
+          if(i==null||i.productId()==null||i.qty()<1||i.qty()>1000)throw bad("Choose a valid product and quantity from 1 to 1000.");
+          Product pr=p.findById(i.productId()).filter(x->x.active).orElseThrow(()->bad("Product not found"));
+          List<Prods.VariantView> choices=readVariants(pr);
+          int unitPrice;
+          String variantLabel="";
+          if(choices.isEmpty()){
+            if(i.variantId()!=null&&!i.variantId().isBlank())throw bad("This product does not have selectable variants.");
+            if(pr.stock<i.qty())throw bad(pr.name+" is out of stock");
+            pr.stock-=i.qty(); unitPrice=pr.price;
+          }else{
+            if(i.variantId()==null||i.variantId().isBlank())throw bad("Select the product options before adding it to your cart.");
+            List<Prods.VariantView> updated=new ArrayList<>(choices.size());
+            Prods.VariantView selected=null;
+            for(Prods.VariantView choice:choices){
+              if(choice.id().equals(i.variantId())){
+                if(choice.stock()<i.qty())throw bad(pr.name+" is out of stock for the selected options");
+                selected=choice;
+                updated.add(new Prods.VariantView(choice.id(),choice.options(),choice.price(),choice.mrp(),choice.stock()-i.qty()));
+              }else updated.add(choice);
+            }
+            if(selected==null)throw bad("The selected product variant is no longer available.");
+            try{pr.variantsData=mapper.writeValueAsString(updated);}
+            catch(JsonProcessingException ex){throw new IllegalStateException("Could not update variant stock for product "+pr.id,ex);}
+            unitPrice=selected.price();
+            variantLabel=" ("+String.join(", ",selected.options().entrySet().stream().map(entry->entry.getKey()+": "+entry.getValue()).toList())+")";
+          }
+          try{base=Math.addExact(base,Math.multiplyExact(unitPrice,i.qty()));}
+          catch(ArithmeticException ex){throw bad("Order total is too large.");}
+          p.save(pr);
+          sb.append(pr.name).append(variantLabel).append(" x").append(i.qty()).append(", ");
+        }
         desc=sb.substring(0,sb.length()-2);
       } else if(type.equals("REPAIR")||type.equals("CUSTOM")){
         if(r.service()==null||r.service().isBlank())throw bad("Choose a repair or custom footwear service.");
@@ -471,11 +585,19 @@ public class Api {
         throw bad("Choose pay now or pay on delivery");
       Booking x=new Booking(); x.userId=uid; x.userName=usr.name; x.userPhone=usr.phone; x.userEmail=usr.email; x.type=type; x.description=desc;
       x.pickup=r.pickup(); x.address=orderAddress.trim();
+      x.deliveryName=quoteRequired?null:cleanOrDefault(r.deliveryName(),usr.name);
+      x.deliveryPhone=quoteRequired?null:cleanOrDefault(r.deliveryPhone(),usr.phone);
+      if(!quoteRequired&&(x.deliveryName.trim().length()<2||x.deliveryName.length()>100||!x.deliveryPhone.replaceAll("\\D","").matches("\\d{10}")))
+        throw bad("Enter a delivery recipient name and a separate 10-digit delivery phone number.");
       x.footwearType="BULK_REPAIR".equals(type)?r.footwearType().trim():null;
       x.estimatedQuantity="BULK_REPAIR".equals(type)?r.estimatedQuantity():null;
       x.total=quoteRequired?0:base+staticData.deliveryCharge(base,r.pickup());
       x.paymentMode=quoteRequired?"QUOTE":r.paymentMode(); x.advance="ONLINE".equals(x.paymentMode)?x.total:0;
       x.paidAmount=0; x.paymentStatus=quoteRequired?"QUOTE_PENDING":("ONLINE".equals(x.paymentMode)?"PENDING":"PAY_ON_DELIVERY");
+      if("MATERIAL".equals(type)){
+        try{x.itemsData=mapper.writeValueAsString(r.items());}
+        catch(JsonProcessingException ex){throw new IllegalStateException("Could not save order item details.",ex);}
+      }
       x.status="PLACED"; x.createdAt=LocalDateTime.now();
       o.save(x); x.orderNo="RK-"+(1000+x.id); o.save(x);
       List<OrderNotificationChannels.EmailAttachment> emailAttachments=new ArrayList<>();
@@ -502,6 +624,7 @@ public class Api {
         +"\nCustomer: "+usr.name+"\nPhone: "+usr.phone+"\nEmail: "+(usr.email==null?"Not provided":usr.email)
         +"\nRequest: "+desc+"\nPickup requested: "+(x.pickup?"Yes":"No")
         +(type.equals("BULK_REPAIR")?"\nShowroom address: "+x.address:"\nDelivery address: "+x.address)
+        +(quoteRequired?"":"\nDelivery contact: "+x.deliveryName+" · "+x.deliveryPhone)
         +(type.equals("BULK_REPAIR")?"\nFootwear: "+x.footwearType+"\nEstimated quantity: "+x.estimatedQuantity+" pairs\nShowroom: "+x.address:"")
         +"\n"+(quoteRequired?"Review the request, then send a quote or decline it in the owner dashboard.":"Order total: ₹"+x.total)
         +(uploads.isEmpty()?"":"\nAttached customer photos: "+uploads.size())
@@ -509,8 +632,186 @@ public class Api {
       if(!emailAttachments.isEmpty()) n.admin(ownerMessage,x.orderNo,emailAttachments);
       else n.admin(ownerMessage,x.orderNo);
       n.user(uid,quoteRequired?"🎉 Order received! Your "+type.toLowerCase().replace('_',' ')+" request "+x.orderNo+" is with our team. We’ll review the details and send you a quote."
-        :"🎉 Order received! Thank you for choosing Raj Kumar Shoe Repairing. Order "+x.orderNo+" is confirmed as received. Total: ₹"+x.total+("ONLINE".equals(x.paymentMode)?" · Pay securely via Google Pay/UPI.":" · Payment is due on delivery.")+"\nDelivery address: "+x.address,x.orderNo);
+        :"🎉 Order received! Thank you for choosing Raj Kumar Shoe Repairing. Order "+x.orderNo+" is confirmed as received. Total: ₹"+x.total+("ONLINE".equals(x.paymentMode)?" · Pay securely via Razorpay.":" · Payment is due on delivery.")+"\nDelivery address: "+x.address,x.orderNo);
       return x; }
+
+    List<Prods.VariantView> readVariants(Product product){
+      if(product.variantsData==null||product.variantsData.isBlank())return List.of();
+      try{return mapper.readValue(product.variantsData,new TypeReference<List<Prods.VariantView>>(){});}
+      catch(JsonProcessingException ex){throw new IllegalStateException("Stored product variants are invalid for product "+product.id,ex);}
+    }
+    static String cleanOrDefault(String value,String fallback){return value==null||value.isBlank()?fallback:value.trim();}
+
+    public record RazorpayVerification(String razorpayOrderId,String razorpayPaymentId,String razorpaySignature){}
+    @PostMapping("/{id}/razorpay-order") @Transactional
+    public Map<String,Object> createRazorpayOrder(@AuthenticationPrincipal Long uid,@PathVariable Long id){
+      Booking order=o.findById(id).filter(item->item.userId.equals(uid)).orElseThrow(Api::nf);
+      requireRazorpayConfigured();
+      ensurePendingOnlineOrder(order);
+      if(order.razorpayOrderId==null){
+        try{
+          Map<String,Object> payload=Map.of("amount",Math.multiplyExact((long)order.total,100L),"currency","INR",
+            "receipt",order.orderNo,"notes",Map.of("app_order_id",order.id.toString()));
+          JsonNode response=razorpayRequest("orders","POST",payload);
+          String gatewayId=response.path("id").asText("");
+          if(gatewayId.isBlank())throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"Razorpay did not return a payment order.");
+          order.razorpayOrderId=gatewayId;
+          o.save(order);
+        }catch(ArithmeticException ex){throw bad("Order total is too large for online payment.");}
+      }
+      return Map.of("keyId",razorpayKeyId,"razorpayOrderId",order.razorpayOrderId,
+        "amount",Math.multiplyExact((long)order.total,100L),"currency","INR",
+        "expiresAt",order.createdAt.plusMinutes(10).toString(),"orderNo",order.orderNo,
+        "customerName",order.deliveryName==null?order.userName:order.deliveryName,
+        "customerPhone",order.deliveryPhone==null?order.userPhone:order.deliveryPhone);
+    }
+
+    @PostMapping("/{id}/razorpay-verify") @Transactional
+    public Booking verifyRazorpayPayment(@AuthenticationPrincipal Long uid,@PathVariable Long id,
+        @RequestBody RazorpayVerification payment){
+      Booking order=o.findById(id).filter(item->item.userId.equals(uid)).orElseThrow(Api::nf);
+      requireRazorpayConfigured();
+      if(payment==null||!Objects.equals(order.razorpayOrderId,payment.razorpayOrderId())
+          ||payment.razorpayPaymentId()==null||payment.razorpaySignature()==null)
+        throw bad("Payment confirmation does not match this order.");
+      if("PAID".equals(order.paymentStatus)&&Objects.equals(order.razorpayPaymentId,payment.razorpayPaymentId()))return order;
+      if(!MessageDigest.isEqual(razorpaySignature(payment.razorpayOrderId(),payment.razorpayPaymentId())
+          .getBytes(java.nio.charset.StandardCharsets.US_ASCII),
+          payment.razorpaySignature().getBytes(java.nio.charset.StandardCharsets.US_ASCII)))
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Razorpay payment signature is invalid.");
+      JsonNode gatewayPayment=razorpayRequest("payments/"+payment.razorpayPaymentId(),"GET",null);
+      if(!Objects.equals(order.razorpayOrderId,gatewayPayment.path("order_id").asText())
+          ||gatewayPayment.path("amount").asLong(-1)!=Math.multiplyExact((long)order.total,100L)
+          ||!"INR".equals(gatewayPayment.path("currency").asText()))
+        throw new ResponseStatusException(HttpStatus.BAD_REQUEST,"Razorpay payment amount or order does not match.");
+      String status=gatewayPayment.path("status").asText();
+      boolean timely="PENDING".equals(order.paymentStatus)&&"PLACED".equals(order.status)
+        &&order.createdAt!=null&&order.createdAt.plusMinutes(10).isAfter(LocalDateTime.now());
+      if(!timely){
+        if("captured".equals(status)){
+          JsonNode refund=razorpayRequest("payments/"+payment.razorpayPaymentId()+"/refund","POST",
+            Map.of("amount",Math.multiplyExact((long)order.total,100L),"notes",Map.of("reason","Checkout expired", "app_order_id",order.id.toString())));
+          boolean reserved="PENDING".equals(order.paymentStatus)&&"PLACED".equals(order.status);
+          if(reserved)releaseReservedStock(order);
+          order.razorpayPaymentId=payment.razorpayPaymentId();
+          order.paidAmount=order.total; order.paymentStatus="REFUND_PENDING"; order.status="CANCELLED";
+          o.save(order);
+          n.user(uid,"Your payment for "+order.orderNo+" arrived after checkout expired. A refund ("+refund.path("id").asText("reference pending")+") has been initiated. Contact the shop if you need help.",order.orderNo);
+          return order;
+        }
+        throw new ResponseStatusException(HttpStatus.CONFLICT,"This payment session expired. Start a new order; any captured amount will be automatically refunded.");
+      }
+      if("authorized".equals(status)){
+        gatewayPayment=razorpayRequest("payments/"+payment.razorpayPaymentId()+"/capture","POST",
+          Map.of("amount",Math.multiplyExact((long)order.total,100L),"currency","INR"));
+        status=gatewayPayment.path("status").asText();
+      }
+      if(!"captured".equals(status))throw new ResponseStatusException(HttpStatus.CONFLICT,"Payment was not captured. Please try again or choose pay on delivery.");
+      order.razorpayPaymentId=payment.razorpayPaymentId();
+      order.paidAmount=order.total; order.paymentStatus="PAID"; order.status="CONFIRMED";
+      Booking saved=o.save(order);
+      n.user(uid,"✅ Payment of ₹"+order.total+" received securely for "+order.orderNo+". Your order is confirmed.",order.orderNo);
+      n.admin("💰 Razorpay payment of ₹"+order.total+" captured for "+order.orderNo+".",order.orderNo);
+      return saved;
+    }
+
+    @PostMapping("/{id}/payment-failed") @Transactional
+    public Booking failRazorpayPayment(@AuthenticationPrincipal Long uid,@PathVariable Long id){
+      Booking order=o.findById(id).filter(item->item.userId.equals(uid)).orElseThrow(Api::nf);
+      if(!"ONLINE".equals(order.paymentMode)||!"PENDING".equals(order.paymentStatus)||!"PLACED".equals(order.status))
+        throw bad("This payment is no longer pending.");
+      expireOnlineOrder(order,"Payment was not completed. No payment was confirmed. Contact the shop if your bank shows a debit.");
+      return order;
+    }
+
+    @Scheduled(fixedDelay=60000)
+    @Transactional
+    public void expirePendingPayments(){
+      LocalDateTime deadline=LocalDateTime.now().minusMinutes(10);
+      for(Booking order:o.findByPaymentModeAndPaymentStatusAndStatus("ONLINE","PENDING","PLACED")){
+        if(order.createdAt!=null&&order.createdAt.isBefore(deadline))
+          expireOnlineOrder(order,"Your payment session expired after 10 minutes. No payment was confirmed. Contact the shop if your bank shows a debit.");
+      }
+    }
+
+    void expireOnlineOrder(Booking order,String message){
+      releaseReservedStock(order);
+      order.status="CANCELLED"; order.paymentStatus="DECLINED"; order.adminNote="Razorpay checkout expired or failed.";
+      o.save(order);
+      n.user(order.userId,message+" Order "+order.orderNo+".",order.orderNo);
+      n.admin("Razorpay payment session expired for "+order.orderNo+".",order.orderNo);
+    }
+
+    void releaseReservedStock(Booking order){
+      if(!"MATERIAL".equals(order.type)||order.itemsData==null||order.itemsData.isBlank())return;
+      List<Item> items;
+      try{items=mapper.readValue(order.itemsData,new TypeReference<List<Item>>(){});}
+      catch(JsonProcessingException ex){throw new IllegalStateException("Could not restore reserved inventory for order "+order.orderNo,ex);}
+      for(Item item:items){
+        Product product=p.findById(item.productId()).orElse(null);
+        if(product==null)continue;
+        List<Prods.VariantView> choices=readVariants(product);
+        if(choices.isEmpty()){
+          product.stock=Math.addExact(product.stock,item.qty());
+        }else{
+          List<Prods.VariantView> updated=new ArrayList<>(choices.size());
+          for(Prods.VariantView choice:choices){
+            if(choice.id().equals(item.variantId()))
+              updated.add(new Prods.VariantView(choice.id(),choice.options(),choice.price(),choice.mrp(),Math.addExact(choice.stock(),item.qty())));
+            else updated.add(choice);
+          }
+          try{product.variantsData=mapper.writeValueAsString(updated);}
+          catch(JsonProcessingException ex){throw new IllegalStateException("Could not restore variant inventory for product "+product.id,ex);}
+        }
+        p.save(product);
+      }
+      order.itemsData=null;
+    }
+
+    void ensurePendingOnlineOrder(Booking order){
+      if(!"ONLINE".equals(order.paymentMode)||!"PENDING".equals(order.paymentStatus)||!"PLACED".equals(order.status))
+        throw bad("This order is no longer eligible for online payment.");
+      if(order.createdAt==null||!order.createdAt.plusMinutes(10).isAfter(LocalDateTime.now()))
+        throw new ResponseStatusException(HttpStatus.GONE,"Payment session expired. Please place the order again.");
+    }
+
+    void requireRazorpayConfigured(){
+      if(razorpayKeyId.isBlank()||razorpayKeySecret.isBlank())
+        throw new ResponseStatusException(HttpStatus.SERVICE_UNAVAILABLE,"Online payments are not configured. Choose pay on delivery or contact the shop.");
+    }
+
+    String razorpaySignature(String orderId,String paymentId){
+      try{
+        javax.crypto.Mac mac=javax.crypto.Mac.getInstance("HmacSHA256");
+        mac.init(new javax.crypto.spec.SecretKeySpec(razorpayKeySecret.getBytes(java.nio.charset.StandardCharsets.UTF_8),"HmacSHA256"));
+        return HexFormat.of().formatHex(mac.doFinal((orderId+"|"+paymentId).getBytes(java.nio.charset.StandardCharsets.UTF_8)));
+      }catch(java.security.GeneralSecurityException ex){throw new IllegalStateException("HMAC-SHA256 is unavailable.",ex);}
+    }
+
+    JsonNode razorpayRequest(String path,String method,Map<String,Object> payload){
+      try{
+        String credentials=Base64.getEncoder().encodeToString((razorpayKeyId+":"+razorpayKeySecret).getBytes(java.nio.charset.StandardCharsets.UTF_8));
+        java.net.http.HttpRequest.Builder builder=java.net.http.HttpRequest.newBuilder()
+          .uri(java.net.URI.create("https://api.razorpay.com/v1/"+path))
+          .timeout(java.time.Duration.ofSeconds(15))
+          .header("Authorization","Basic "+credentials)
+          .header("Content-Type","application/json");
+        if("GET".equals(method))builder.GET();
+        else builder.method(method,java.net.http.HttpRequest.BodyPublishers.ofString(mapper.writeValueAsString(payload)));
+        java.net.http.HttpResponse<String> response=java.net.http.HttpClient.newHttpClient().send(builder.build(),
+          java.net.http.HttpResponse.BodyHandlers.ofString());
+        JsonNode result=mapper.readTree(response.body());
+        if(response.statusCode()<200||response.statusCode()>=300)
+          throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"Razorpay could not complete the payment request. Please retry or choose pay on delivery.");
+        return result;
+      }catch(ResponseStatusException ex){throw ex;}
+      catch(InterruptedException ex){
+        Thread.currentThread().interrupt();
+        throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"Razorpay payment request was interrupted. Please retry.",ex);
+      }catch(IOException ex){
+        throw new ResponseStatusException(HttpStatus.BAD_GATEWAY,"Razorpay could not be reached. Please retry or choose pay on delivery.",ex);
+      }
+    }
 
     @PostMapping("/{id}/payment") @Transactional public Booking pay(@AuthenticationPrincipal Long uid,@PathVariable Long id,@RequestBody PaymentSubmission payment){
       Booking x=o.findById(id).filter(y->y.userId.equals(uid)).orElseThrow(Api::nf);
@@ -550,6 +851,7 @@ public class Api {
       if(reason.length()>300)throw bad("Cancellation reason must be 300 characters or fewer.");
       order.status="CANCELLED";
       boolean refundRequired=order.paidAmount>0||"AWAITING_VERIFICATION".equals(order.paymentStatus);
+      releaseReservedStock(order);
       order.paymentStatus=refundRequired?"REFUND_PENDING":"NONE";
       order.adminNote=reason.isBlank()?"Cancelled by customer":reason;
       o.save(order);
@@ -637,10 +939,10 @@ public class Api {
 
   @RestController @RequestMapping("/api/admin/orders") public static class AdminOrds {
     final Bookings o; final Users users; final Notify n; final com.rajkumar.shoe.config.AppServiceContext appServiceContext;
-    final String whatsAppCountryCode;
-    public AdminOrds(Bookings o,Users users,Notify n, com.rajkumar.shoe.config.AppServiceContext appServiceContext,
+    final String whatsAppCountryCode; final Ords orderService;
+    public AdminOrds(Bookings o,Users users,Notify n, com.rajkumar.shoe.config.AppServiceContext appServiceContext,Ords orderService,
         @Value("${app.notifications.whatsapp-country-code:91}") String whatsAppCountryCode){
-      this.o=o; this.users=users; this.n=n; this.appServiceContext=appServiceContext; this.whatsAppCountryCode=whatsAppCountryCode;
+      this.o=o; this.users=users; this.n=n; this.appServiceContext=appServiceContext; this.whatsAppCountryCode=whatsAppCountryCode; this.orderService=orderService;
     }
     public record Dec(boolean approve,String note){}
     public record St(String status){}
@@ -673,6 +975,7 @@ public class Api {
       if(d.approve()){ if("ONLINE".equals(x.paymentMode)&&!"AWAITING_VERIFICATION".equals(x.paymentStatus)) throw bad("Verify the submitted Google Pay/UPI payment before approving this order."); x.status="CONFIRMED"; if("ONLINE".equals(x.paymentMode)){ x.paymentStatus="PAID"; x.paidAmount=x.total; } else x.paymentStatus="PAY_ON_DELIVERY";
         n.user(x.userId,"✅ Your order has been reviewed and approved! Order "+x.orderNo+" is now confirmed."+("PAY_ON_DELIVERY".equals(x.paymentStatus)?" Total ₹"+x.total+" is payable on delivery.":" Payment received and verified."),x.orderNo);
       } else { x.status="DECLINED";
+        orderService.releaseReservedStock(x);
         boolean refundRequired=x.paidAmount>0||"AWAITING_VERIFICATION".equals(x.paymentStatus);
         if(refundRequired){ x.paymentStatus="REFUND_PENDING"; n.user(x.userId,String.format(NotificationMessages.OWNER_CANCELLED_ORDER,x.orderNo,"Any payment received is being reviewed for refund."+note),x.orderNo); }
         else { x.paymentStatus="NONE"; n.user(x.userId,String.format(NotificationMessages.OWNER_CANCELLED_ORDER,x.orderNo,note),x.orderNo); }
@@ -687,6 +990,7 @@ public class Api {
       if(reason.length()>300)throw bad("Cancellation reason must be 300 characters or fewer.");
       order.status="CANCELLED";
       boolean refundRequired=order.paidAmount>0||"AWAITING_VERIFICATION".equals(order.paymentStatus);
+      orderService.releaseReservedStock(order);
       order.paymentStatus=refundRequired?"REFUND_PENDING":"NONE";
       order.adminNote=reason.isBlank()?"Cancelled by the shop":reason;
       o.save(order);

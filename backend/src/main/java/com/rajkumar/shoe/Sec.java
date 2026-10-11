@@ -71,7 +71,7 @@ public class Sec {
         String sessionId=cl.get("sid",String.class);
         UserSession session=sessions.findById(sessionId).orElseThrow(()->new JwtException("Session expired"));
         LocalDateTime now=LocalDateTime.now();
-        if(session.lastActivity==null||Duration.between(session.lastActivity,now).toMillis()>=idleTimeoutMs){
+        if(session.lastActivity==null||Duration.between(session.lastActivity,now).toMillis()>idleTimeoutMs){
           sessions.delete(session);
           throw new JwtException("Session expired");
         }
